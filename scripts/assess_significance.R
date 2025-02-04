@@ -1,62 +1,153 @@
 #!/usr/bin/env Rscript
 
-library(rtracklayer)
+# Parse Args --------------------------------------------------------------
+args <- commandArgs(trailingOnly = TRUE)
 
-args <- commandArgs()
+if (length(args) < 3 | length(args) > 3) {
+  stop(
+    "At least three arguments must be supplied:
+    assess_significance.R [input_CNVs] [input_ratio.txt] [output_file]",
+    call. = FALSE
+  )
+}
 
-dataTable <-read.table(args[5], header=TRUE);
-ratio<-data.frame(dataTable)
+cnv_path <- args[1]
+ratio_path <- args[2]
+output_path <- args[3]
 
-dataTable <- read.table(args[4], header=FALSE)
-cnvs<- data.frame(dataTable)
+# Load Dependencies -------------------------------------------------------
+suppressMessages({library(rtracklayer)})
 
-ratio$Ratio[which(ratio$Ratio==-1)]=NA
+if (require(matrixTests)) {
+  message("[INFO] 'matrixTests' package available, using faster function 'matrixTests::col_wilcoxon_twosample' for wilcoxon test.")
+  wilcoxon_stat_function <- matrixTests::col_wilcoxon_twosample
+} else {
+  message("[INFO] 'matrixTests' package available, using slower function 'stats::wilcox.test' for Wilcoxon test.")
+  wilcoxon_stat_function <- stats::wilcox.test
+}
 
-cnvs.bed=GRanges(cnvs[,1],IRanges(cnvs[,2],cnvs[,3]))  
-ratio.bed=GRanges(ratio$Chromosome,IRanges(ratio$Start,ratio$Start),score=ratio$Ratio)
-
-overlaps <- subsetByOverlaps(ratio.bed,cnvs.bed)
-normals <- setdiff(ratio.bed,cnvs.bed)
-normals <- subsetByOverlaps(ratio.bed,normals)
-
-#mu <- mean(score(normals),na.rm=TRUE)
-#sigma<- sd(score(normals),na.rm=TRUE)
-
-#hist(score(normals),n=500,xlim=c(0,2))
-#hist(log(score(normals)),n=500,xlim=c(-1,1))
-
-#shapiro.test(score(normals)[which(!is.na(score(normals)))][5001:10000])
-#qqnorm (score(normals)[which(!is.na(score(normals)))],ylim=(c(0,10)))
-#qqline(score(normals)[which(!is.na(score(normals)))], col = 2)
-
-#shapiro.test(log(score(normals))[which(!is.na(score(normals)))][5001:10000])
-#qqnorm (log(score(normals))[which(!is.na(score(normals)))],ylim=(c(-6,10)))
-#qqline(log(score(normals))[which(!is.na(score(normals)))], col = 2)
-
-numberOfCol=length(cnvs)
-
-for (i in c(1:length(cnvs[,1]))) {
-  values <- score(subsetByOverlaps(ratio.bed,cnvs.bed[i]))
-  #wilcox.test(values,mu=mu)
-  W <- function(values,normals){resultw <- try(wilcox.test(values,score(normals)), silent = TRUE)
-	if(class(resultw)=="try-error") return(list("statistic"=NA,"parameter"=NA,"p.value"=NA,"null.value"=NA,"alternative"=NA,"method"=NA,"data.name"=NA)) else resultw}
-  KS <- function(values,normals){resultks <- try(ks.test(values,score(normals)), silent = TRUE)
-	if(class(resultks)=="try-error") return(list("statistic"=NA,"p.value"=NA,"alternative"=NA,"method"=NA,"data.name"=NA)) else resultks}
-  #resultks <- try(KS <- ks.test(values,score(normals)), silent = TRUE)
-  #	if(class(resultks)=="try-error") NA) else resultks
-  cnvs[i,numberOfCol+1]=W(values,normals)$p.value
-  cnvs[i,numberOfCol+2]=KS(values,normals)$p.value
+# Functions ---------------------------------------------------------------
+#' Get Expected CNV Column Names
+#' @description Deduces the expected column names from `cnv_path` based on the
+#' number of columns it has.
+#' @param cnv_path path to CNV file.
+#'
+#' @returns vector of expected column names
+get_cnv_colnames <- function(cnv_path) {
+  colname_groups = list(
+    base = c("chr", "start", "end", "copy number", "status"),
+    genotyped = c("genotype", "uncertainty"),
+    paired = c("somatic/germline", "percentageOfGermline")
+  )
+  cnv_col_no <- length(colnames(read.table(cnv_path, header=FALSE)))
+  
+  if (cnv_col_no == 5) {
+    col_names <- c(colname_groups[["base"]])
+  } else if (cnv_col_no == 7) {
+    col_names <- c(colname_groups[["base"]], colname_groups[["genotyped"]])
+  } else if (cnv_col_no == 9) {
+    col_names <- c(
+      colname_groups[["base"]],
+      colname_groups[["genotyped"]],
+      colname_groups[["paired"]]
+    )
   }
-
-if (numberOfCol==5) {
-  names(cnvs)=c("chr","start","end","copy number","status","WilcoxonRankSumTestPvalue","KolmogorovSmirnovPvalue")  
+  return(col_names)
 }
-if (numberOfCol==7) {
-  names(cnvs)=c("chr","start","end","copy number","status","genotype","uncertainty","WilcoxonRankSumTestPvalue","KolmogorovSmirnovPvalue")  
-}
-if (numberOfCol==9) {
-  names(cnvs)=c("chr","start","end","copy number","status","genotype","uncertainty","somatic/germline","precentageOfGermline","WilcoxonRankSumTestPvalue","KolmogorovSmirnovPvalue")  
-}
-write.table(cnvs, file=paste(args[4],".p.value.txt",sep=""),sep="\t",quote=F,row.names=F)
 
+#' Calculates p-value of cnv_ratios against normal_ratios given
+#' @description Calculates the p-value for either Wilcoxon or Kolmogorov-Smirnov
+#' tests, returning `NA` if there are any raised errors.
+#' @param cnv_ratios the ratios for genomic ranges that intersect with CNVs
+#' @param normal_ratios the ratios for genomic ranges that do not intersect CNVs
+#' @param stat_function the stat function to use
+#' (`matrixTests::col_wilcoxon_twosample|stats::wilcox.test|stats::ks.test`)
+#'
+#' @returns p-value
+get_pval <- function(cnv_ratios, normal_ratios, stat_function) {
+  tryCatch(
+    {
+      result <- suppressWarnings({stat_function(cnv_ratios,normal_ratios)})
+      names(result)[names(result) == "p.value"] <- "pvalue"
+      pval <- result$pvalue
+      return(pval)
+    },
+    error = function(e) {
+      cat("An error occurred, returning 'NA':", conditionMessage(e), "\n")
+      return(NA)
+    }
+  )
+}
 
+#' Main body function
+#'
+#' @param cnv_path path to `*_CNVs` file produce by ControlFREEC
+#' @param ratio_path path to `*_ratio.txt` file produce by ControlFREEC 
+#' @param output_path output path for annotated CNV file
+#' @param wilcoxon_stat_function stat function to use for Wilcoxon test. If
+#' `MatrixTests` is installed, use faster `matrixTests::col_wilcoxon_twosample`
+#'
+#' @returns Writes annotated CNV `DataFrame` with p-values to `output_path`
+main <- function(cnv_path, ratio_path, output_path, wilcoxon_stat_function) {
+  message("[INFO] Loading data")
+  ratio_df <- read.table(ratio_path, header = TRUE)
+  ratio_df$Ratio[which(ratio_df$Ratio == -1)] = NA
+  cnv_df <- read.table(cnv_path, col.names = get_cnv_colnames(cnv_path))
+  
+  message("[INFO] Retrieving genomic ranges")
+  cnv_bed_gr <- GenomicRanges::GRanges(
+    seqnames = cnv_df$chr,
+    ranges = IRanges::IRanges(cnv_df$start, cnv_df$end)
+  )
+  ratio_bed_gr <- GenomicRanges::GRanges(
+    seqnames = ratio_df$Chromosome,
+    ranges = IRanges::IRanges(ratio_df$Start, ratio_df$Start),
+    score = ratio_df$Ratio
+  )
+  
+  normals_gr <- IRanges::subsetByOverlaps(
+    ratio_bed_gr,
+    IRanges::setdiff(ratio_bed_gr, cnv_bed_gr)
+  )
+  normal_ratios <- BiocGenerics::score(normals_gr)
+  
+  message("[INFO] Calculating P-values:")
+  pb <- utils::txtProgressBar(
+    min = 0,
+    max = nrow(cnv_df),
+    initial = 0,
+    style = 3
+  )
+  pvalues <- list(wilcox = c(), ks = c())
+  
+  for (i in 1:nrow(cnv_df)) {
+    utils::setTxtProgressBar(pb, i)
+    
+    cnv_ratios <- BiocGenerics::score(
+      IRanges::subsetByOverlaps(ratio_bed_gr, cnv_bed_gr[i])
+    )
+    
+    wilcox_pval <- get_pval(cnv_ratios, normal_ratios, wilcoxon_stat_function)
+    ks_pval <- get_pval(cnv_ratios, normal_ratios, stats::ks.test)
+    
+    pvalues[["wilcox"]] <- c(pvalues[["wilcox"]], wilcox_pval)
+    pvalues[["ks"]] <- c(pvalues[["ks"]], ks_pval)
+  }
+  close(pb)
+  
+  message("[INFO] Appending P-values to original CNV data")
+  cnv_df[["WilcoxonRankSumTestPvalue"]] <- pvalues[["wilcox"]]
+  cnv_df[["KolmogorovSmirnovPvalue"]] <- pvalues[["ks"]]
+  
+  message(paste("[INFO] Writing output to:", output_path))
+  write.table(
+    cnv_df,
+    file = output_path,
+    sep="\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+}
+
+# Main --------------------------------------------------------------------
+main(cnv_path, ratio_path, output_path, wilcoxon_stat_function)
